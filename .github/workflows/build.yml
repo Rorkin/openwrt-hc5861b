@@ -1,0 +1,325 @@
+name: Build OpenWrt HC5861B Hysteria2
+
+on:
+  workflow_dispatch:
+    inputs:
+      RELEASE:
+        description: '发布到 Release'
+        type: boolean
+        default: true
+
+env:
+  REPO_URL: https://github.com/openwrt/openwrt.git
+  REPO_BRANCH: v23.05.5
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Free disk space
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: true
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        docker-images: true
+        swap-storage: true
+
+    - name: Show available space
+      run: |
+        echo "=== Disk ==="
+        df -hT /
+        echo "=== RAM ==="
+        free -h
+
+    - name: Install dependencies
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install -y \
+          ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+          build-essential bzip2 ccache clang cmake cpio curl \
+          device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib \
+          g++-multilib git gnutls-dev gperf haveged help2man intltool jq \
+          lib32gcc-s1 libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev \
+          libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev \
+          libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool \
+          libz-dev lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full \
+          patch pkgconf python3 python3-pyelftools python3-setuptools \
+          qemu-utils rsync scons squashfs-tools subversion swig texinfo \
+          uglifyjs unzip upx-ucl vim wget xmlto xxd zlib1g-dev zstd
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    - name: Clone OpenWrt ${{ env.REPO_BRANCH }}
+      working-directory: /workdir
+      run: |
+        git clone --depth 1 --branch $REPO_BRANCH $REPO_URL openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        cd openwrt
+        echo "✅ OpenWrt $(cat version) @ $(git log --oneline -1)"
+
+    # =============================================
+    # ★ 关键：验证设备是否被 OpenWrt 23.05.5 支持
+    # =============================================
+    - name: Verify device support
+      run: |
+        cd openwrt
+        echo "========================================="
+        echo "  Checking HC5861B device support"
+        echo "========================================="
+
+        # 检查 mt7620 image 定义文件
+        MT7620_MK="target/linux/ramips/image/mt7620.mk"
+        if [ ! -f "$MT7620_MK" ]; then
+          echo "❌ File not found: $MT7620_MK"
+          exit 1
+        fi
+
+        echo "--- All HiWiFi devices in mt7620.mk ---"
+        grep -i "hiwifi\|hc586\|hc576\|hc566" "$MT7620_MK" || true
+        echo "----------------------------------------"
+
+        # 查找 hc5861b
+        if grep -q "hc5861b" "$MT7620_MK"; then
+          echo "✅ hiwifi_hc5861b FOUND in mt7620.mk"
+        else
+          echo ""
+          echo "⚠️  hc5861b not found in mt7620.mk"
+          echo ""
+          echo "Available HiWiFi devices:"
+          grep "Device/" "$MT7620_MK" | grep -i hiwifi || true
+          echo ""
+          echo "All MT7620 devices:"
+          grep "^define Device/" "$MT7620_MK" | sed 's/define Device\//  /' | sort
+          echo ""
+          echo "❌ BUILD WILL LIKELY FAIL"
+          echo "   Please check the device name and update configs/hc5861b.config"
+          exit 1
+        fi
+
+        # 检查 DTS 文件
+        echo "--- Checking DTS ---"
+        find target/linux/ramips/dts/ -name "*hc5861b*" -o -name "*hc5861*" | head -5
+        echo "--------------------"
+
+    - name: Add Passwall2 feeds
+      run: |
+        chmod +x scripts/feeds.sh
+        cd openwrt
+        $GITHUB_WORKSPACE/scripts/feeds.sh
+
+    - name: Update and install feeds
+      run: |
+        cd openwrt
+
+        # 更新 feeds（带重试）
+        for i in 1 2 3; do
+          echo ">>> feeds update attempt $i/3"
+          ./scripts/feeds update -a && break
+          echo "⚠️  Failed, waiting 15s..."
+          sleep 15
+          [ $i -eq 3 ] && { echo "❌ feeds update failed after 3 attempts"; exit 1; }
+        done
+
+        # 安装 feeds
+        ./scripts/feeds install -a
+
+        # 验证关键 feed
+        echo "=== Verify feeds ==="
+        for feed in passwall_packages passwall2; do
+          if [ -d "feeds/$feed" ]; then
+            echo "✅ $feed: $(ls feeds/$feed/ | wc -l) packages"
+          else
+            echo "❌ $feed: MISSING"
+            exit 1
+          fi
+        done
+
+        # 验证关键包
+        echo "=== Verify key packages ==="
+        for pkg in luci-app-passwall2 hysteria sing-box chinadns-ng; do
+          if ./scripts/feeds list | grep -q "^$pkg "; then
+            echo "✅ $pkg"
+          else
+            echo "⚠️  $pkg not found in feeds"
+          fi
+        done
+
+    - name: Generate configuration
+      run: |
+        chmod +x scripts/customize.sh
+        cd openwrt
+        cp $GITHUB_WORKSPACE/configs/hc5861b.config .config
+        $GITHUB_WORKSPACE/scripts/customize.sh
+        make defconfig
+
+        echo ""
+        echo "========== .config summary =========="
+        echo "--- Target ---"
+        grep "^CONFIG_TARGET" .config | head -5
+        echo "--- Passwall2 ---"
+        grep -i "passwall2" .config | grep "=y"
+        echo "--- Proxy cores ---"
+        grep -E "hysteria|sing.box|xray|shadowsocks" .config | grep "=y" || echo "(none explicitly set)"
+        echo "--- WiFi ---"
+        grep -E "mt76|rt2800|wpad" .config | grep "=y"
+        echo "--- Memory ---"
+        grep -i "zram" .config | grep "=y" || echo "(no zram)"
+        echo "====================================="
+        echo ""
+        echo "========== Full diffconfig =========="
+        ./scripts/diffconfig.sh
+        echo "====================================="
+
+    - name: Download packages
+      run: |
+        cd openwrt
+        make download -j16
+        # 清理下载失败的文件
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+        echo "✅ $(ls dl/ | wc -l) source archives"
+
+    - name: Compile firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo "======================================="
+        echo "  Compile started: $(date)"
+        echo "  Threads: $(nproc)"
+        echo "======================================="
+
+        make -j$(nproc) 2>&1 | tee /tmp/build.log | grep -E "^\[|make\[|error" | tail -30
+        BUILD_EXIT=${PIPESTATUS[0]}
+
+        if [ $BUILD_EXIT -ne 0 ]; then
+          echo ""
+          echo "⚠️  Parallel build failed. Retrying single-thread with verbose..."
+          echo ""
+          make -j1 V=s 2>&1 | tee /tmp/build-v.log | tail -200
+          BUILD_EXIT=$?
+        fi
+
+        if [ $BUILD_EXIT -ne 0 ]; then
+          echo ""
+          echo "❌ BUILD FAILED"
+          echo "Last 50 lines of build log:"
+          tail -50 /tmp/build-v.log 2>/dev/null || tail -50 /tmp/build.log
+          exit 1
+        fi
+
+        echo ""
+        echo "======================================="
+        echo "  Compile finished: $(date)"
+        echo "======================================="
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    # =============================================
+    # ★ 关键：验证固件输出（正确目录 mt7620）
+    # =============================================
+    - name: Verify firmware
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        # ★ 正确的输出目录
+        OUTPUT="openwrt/bin/targets/ramips/mt7620"
+
+        if [ ! -d "$OUTPUT" ]; then
+          echo "❌ Output directory not found: $OUTPUT"
+          echo "Available target directories:"
+          find openwrt/bin/targets/ -type d | head -20
+          exit 1
+        fi
+
+        echo "========== All output files =========="
+        ls -lhS "$OUTPUT"/ 2>/dev/null
+        echo "======================================"
+
+        # 查找 sysupgrade
+        SYSUPGRADE=$(find "$OUTPUT" -name "*hc5861b*sysupgrade*" -type f | head -1)
+        if [ -n "$SYSUPGRADE" ]; then
+          SIZE=$(ls -lh "$SYSUPGRADE" | awk '{print $5}')
+          NAME=$(basename "$SYSUPGRADE")
+          echo "✅ Sysupgrade: $NAME ($SIZE)"
+          echo "SYSUPGRADE_NAME=$NAME" >> $GITHUB_ENV
+          echo "SYSUPGRADE_SIZE=$SIZE" >> $GITHUB_ENV
+        else
+          echo "❌ Sysupgrade firmware NOT FOUND!"
+          echo "All .bin/.img files:"
+          find "$OUTPUT" -type f \( -name "*.bin" -o -name "*.img" \) | sort
+          exit 1
+        fi
+
+        # 查找 factory
+        FACTORY=$(find "$OUTPUT" -name "*hc5861b*factory*" -type f | head -1)
+        if [ -n "$FACTORY" ]; then
+          SIZE=$(ls -lh "$FACTORY" | awk '{print $5}')
+          echo "✅ Factory: $(basename $FACTORY) ($SIZE)"
+        else
+          echo "ℹ️  No factory firmware (normal for some NAND devices)"
+        fi
+
+    - name: Organize files
+      id: organize
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        cd openwrt/bin/targets/ramips/mt7620
+        rm -rf packages/
+        rm -f *.buildinfo *.manifest sha256sums
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "FILE_DATE=$(date +%Y%m%d%H%M)" >> $GITHUB_ENV
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      if: steps.compile.outputs.status == 'success'
+      with:
+        name: OpenWrt-HC5861B-Hysteria2-${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}/*
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      if: steps.compile.outputs.status == 'success' && github.event.inputs.RELEASE == 'true'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: v23.05.5-${{ env.FILE_DATE }}
+        body: |
+          ## OpenWrt 23.05.5 — 极路由3 Pro (HC5861B) + Passwall2 Hysteria2
+
+          | 项目 | 值 |
+          |---|---|
+          | 设备 | HiWiFi R33 / HC5861B / 极路由3 Pro |
+          | CPU | MT7620A 单核 580MHz |
+          | 内存 | 128MB DDR2 / 128MB NAND |
+          | 默认 IP | **192.168.10.1** |
+          | 默认密码 | 无 (首次登录设置) |
+
+          ### 核心功能
+          - ✅ **Passwall2** 透明代理 (中文界面)
+          - ✅ **Hysteria2** 独立客户端 (首选，轻量)
+          - ✅ **SingBox** 备选核心 (支持更多协议)
+          - ✅ **ChinaDNS-NG** DNS 智能分流
+          - ✅ **TPROXY** TCP + UDP 全透明代理
+          - ✅ **zram-swap** 内存优化
+
+          ### 使用方式
+          1. 刷入固件，访问 `192.168.10.1`
+          2. 服务 → PassWall2 → 添加节点 → Hysteria2
+          3. 填写服务器地址、端口、密码
+          4. 开启主开关，所有设备自动走代理
+
+          ### 刷机
+          - Breed → `sysupgrade.bin`
+          - OpenWrt → `sysupgrade -v xxx.bin`
+        files: ${{ env.FIRMWARE }}/*
