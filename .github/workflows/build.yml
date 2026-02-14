@@ -229,4 +229,60 @@ jobs:
         echo "=================================="
 
         # 搜索包含 hc5861 或 hiwifi 的固件
-        SYSUPGRADE=$(find "$OUTPUT" -name 
+        SYSUPGRADE=$(find "$OUTPUT" -name "*hc5861*sysupgrade*" -o -name "*hiwifi*sysupgrade*" | head -1)
+        if [ -n "$SYSUPGRADE" ]; then
+          SIZE=$(ls -lh "$SYSUPGRADE" | awk '{print $5}')
+          echo "✅ Sysupgrade: $(basename $SYSUPGRADE) ($SIZE)"
+        else
+          echo "❌ Sysupgrade NOT FOUND"
+          find "$OUTPUT" -type f \( -name "*.bin" -o -name "*.img" \) | sort
+          exit 1
+        fi
+
+    - name: Organize
+      id: organize
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        cd immortalwrt/bin/targets/ramips/mt7620
+        rm -rf packages/
+        rm -f *.buildinfo *.manifest sha256sums
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "FILE_DATE=$(date +%Y%m%d%H%M)" >> $GITHUB_ENV
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      if: steps.compile.outputs.status == 'success'
+      with:
+        name: ImmortalWrt-HC5861B-${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}/*
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      if: steps.compile.outputs.status == 'success' && github.event.inputs.RELEASE == 'true'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: v23.05-${{ env.FILE_DATE }}
+        body: |
+          ## ImmortalWrt 23.05 — 极路由3 Pro (HC5861B/R33) + Passwall2
+
+          | 项目 | 值 |
+          |---|---|
+          | 设备 | HiWiFi R33 / HC5861B / 极路由3 Pro |
+          | CPU | MT7620A 单核 580MHz |
+          | 内存 | 128MB DDR2 / 128MB NAND |
+          | 基于 | ImmortalWrt 23.05 (OpenWrt 分支) |
+          | 默认 IP | **192.168.10.1** |
+          | 默认密码 | 无 |
+
+          ### 包含
+          - ✅ Passwall2 + Hysteria2
+          - ✅ SingBox (含 QUIC) 备选
+          - ✅ ChinaDNS-NG DNS 分流
+          - ✅ TPROXY TCP+UDP 透明代理
+          - ✅ zram-swap 内存优化
+
+          ### 刷机
+          - Breed 下 → 上传固件文件
+          - **必须先刷 Breed，确保可以救砖**
+        files: ${{ env.FIRMWARE }}/*
