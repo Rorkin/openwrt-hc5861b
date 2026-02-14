@@ -5,16 +5,17 @@ echo "==========================================="
 echo "  Adding Passwall2 feeds"
 echo "==========================================="
 
-# Passwall 代理核心包（hysteria, sing-box, chinadns-ng 等）
-#echo "src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git;main" >> feeds.conf.default
-
-# Passwall2 LuCI 应用
-#echo "src-git passwall2 https://github.com/xiaorouji/openwrt-passwall2.git;main" >> feeds.conf.default
-
-# passwall_packages: 包含 hysteria, xray-core, sing-box 等核心组件
-echo "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git;main" >> feeds.conf.default
-# passwall2: LuCI 界面
-echo "src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git;main" >> feeds.conf.default
+# 检查是否已有 passwall 相关源（ImmortalWrt 可能自带）
+if grep -q "passwall" feeds.conf.default 2>/dev/null; then
+  echo "ℹ️  Passwall feeds already present in ImmortalWrt"
+  cat feeds.conf.default
+else
+  cat >> feeds.conf.default << 'EOF'
+src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git;main
+src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git;main
+EOF
+  echo "✅ Passwall2 feeds added"
+fi
 
 echo ""
 echo "--- feeds.conf.default ---"
