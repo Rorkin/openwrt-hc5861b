@@ -1,4 +1,4 @@
-name: Build OpenWrt HC5861B Hysteria2
+name: Build OpenWrt HC5861 Hysteria2
 
 on:
   workflow_dispatch:
@@ -32,13 +32,6 @@ jobs:
         docker-images: true
         swap-storage: true
 
-    - name: Show available space
-      run: |
-        echo "=== Disk ==="
-        df -hT /
-        echo "=== RAM ==="
-        free -h
-
     - name: Install dependencies
       env:
         DEBIAN_FRONTEND: noninteractive
@@ -70,49 +63,36 @@ jobs:
         cd openwrt
         echo "✅ OpenWrt $(cat version) @ $(git log --oneline -1)"
 
-    # =============================================
-    # ★ 关键：验证设备是否被 OpenWrt 23.05.5 支持
-    # =============================================
     - name: Verify device support
       run: |
         cd openwrt
-        echo "========================================="
-        echo "  Checking HC5861B device support"
-        echo "========================================="
+        echo "==========================================="
+        echo "  Checking HC5861 device support"
+        echo "==========================================="
 
-        # 检查 mt7620 image 定义文件
         MT7620_MK="target/linux/ramips/image/mt7620.mk"
+
         if [ ! -f "$MT7620_MK" ]; then
-          echo "❌ File not found: $MT7620_MK"
+          echo "❌ $MT7620_MK not found"
           exit 1
         fi
 
-        echo "--- All HiWiFi devices in mt7620.mk ---"
-        grep -i "hiwifi\|hc586\|hc576\|hc566" "$MT7620_MK" || true
-        echo "----------------------------------------"
-
-        # 查找 hc5861b
-        if grep -q "hc5861b" "$MT7620_MK"; then
-          echo "✅ hiwifi_hc5861b FOUND in mt7620.mk"
+        # ★ 修正：查找 hc5861（非 hc5861b）
+        if grep -q "Device/hiwifi_hc5861" "$MT7620_MK"; then
+          echo "✅ hiwifi_hc5861 FOUND"
+          echo ""
+          echo "--- Device definition ---"
+          sed -n '/define Device\/hiwifi_hc5861$/,/^$/p' "$MT7620_MK"
+          echo "-------------------------"
         else
-          echo ""
-          echo "⚠️  hc5861b not found in mt7620.mk"
-          echo ""
-          echo "Available HiWiFi devices:"
-          grep "Device/" "$MT7620_MK" | grep -i hiwifi || true
-          echo ""
-          echo "All MT7620 devices:"
-          grep "^define Device/" "$MT7620_MK" | sed 's/define Device\//  /' | sort
-          echo ""
-          echo "❌ BUILD WILL LIKELY FAIL"
-          echo "   Please check the device name and update configs/hc5861b.config"
+          echo "❌ hiwifi_hc5861 NOT FOUND"
           exit 1
         fi
 
-        # 检查 DTS 文件
-        echo "--- Checking DTS ---"
-        find target/linux/ramips/dts/ -name "*hc5861b*" -o -name "*hc5861*" | head -5
-        echo "--------------------"
+        # 检查 DTS
+        echo "--- DTS files ---"
+        find target/linux/ramips/dts/ -name "*hc5861*" -type f
+        echo "-----------------"
 
     - name: Add Passwall2 feeds
       run: |
@@ -124,37 +104,25 @@ jobs:
       run: |
         cd openwrt
 
-        # 更新 feeds（带重试）
         for i in 1 2 3; do
           echo ">>> feeds update attempt $i/3"
           ./scripts/feeds update -a && break
           echo "⚠️  Failed, waiting 15s..."
           sleep 15
-          [ $i -eq 3 ] && { echo "❌ feeds update failed after 3 attempts"; exit 1; }
+          [ $i -eq 3 ] && { echo "❌ feeds update failed"; exit 1; }
         done
 
-        # 安装 feeds
         ./scripts/feeds install -a
 
-        # 验证关键 feed
+        # 验证
         echo "=== Verify feeds ==="
         for feed in passwall_packages passwall2; do
-          if [ -d "feeds/$feed" ]; then
-            echo "✅ $feed: $(ls feeds/$feed/ | wc -l) packages"
-          else
-            echo "❌ $feed: MISSING"
-            exit 1
-          fi
+          test -d "feeds/$feed" && echo "✅ $feed" || { echo "❌ $feed MISSING"; exit 1; }
         done
 
-        # 验证关键包
-        echo "=== Verify key packages ==="
+        echo "=== Verify packages ==="
         for pkg in luci-app-passwall2 hysteria sing-box chinadns-ng; do
-          if ./scripts/feeds list | grep -q "^$pkg "; then
-            echo "✅ $pkg"
-          else
-            echo "⚠️  $pkg not found in feeds"
-          fi
+          ./scripts/feeds list | grep -q "^$pkg " && echo "✅ $pkg" || echo "⚠️  $pkg not found"
         done
 
     - name: Generate configuration
@@ -166,108 +134,72 @@ jobs:
         make defconfig
 
         echo ""
-        echo "========== .config summary =========="
+        echo "========== Config check =========="
         echo "--- Target ---"
         grep "^CONFIG_TARGET" .config | head -5
         echo "--- Passwall2 ---"
         grep -i "passwall2" .config | grep "=y"
         echo "--- Proxy cores ---"
-        grep -E "hysteria|sing.box|xray|shadowsocks" .config | grep "=y" || echo "(none explicitly set)"
-        echo "--- WiFi ---"
-        grep -E "mt76|rt2800|wpad" .config | grep "=y"
-        echo "--- Memory ---"
-        grep -i "zram" .config | grep "=y" || echo "(no zram)"
-        echo "====================================="
+        grep -iE "hysteria|sing.box" .config | grep "=y"
+        echo "--- TPROXY ---"
+        grep -i "tproxy" .config | grep "=y"
+        echo "--- zram ---"
+        grep -i "zram" .config | grep "=y"
+        echo "=================================="
         echo ""
-        echo "========== Full diffconfig =========="
+        echo "========== diffconfig =========="
         ./scripts/diffconfig.sh
-        echo "====================================="
+        echo "================================"
 
     - name: Download packages
       run: |
         cd openwrt
         make download -j16
-        # 清理下载失败的文件
-        find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
         echo "✅ $(ls dl/ | wc -l) source archives"
 
-    - name: Compile firmware
+    - name: Compile
       id: compile
       run: |
         cd openwrt
-        echo "======================================="
-        echo "  Compile started: $(date)"
-        echo "  Threads: $(nproc)"
-        echo "======================================="
+        echo "Started: $(date), Threads: $(nproc)"
 
-        make -j$(nproc) 2>&1 | tee /tmp/build.log | grep -E "^\[|make\[|error" | tail -30
+        make -j$(nproc) 2>&1 | tee /tmp/build.log | grep -E "^\[|error" | tail -30
         BUILD_EXIT=${PIPESTATUS[0]}
 
         if [ $BUILD_EXIT -ne 0 ]; then
-          echo ""
-          echo "⚠️  Parallel build failed. Retrying single-thread with verbose..."
-          echo ""
+          echo "⚠️  Retrying single-thread..."
           make -j1 V=s 2>&1 | tee /tmp/build-v.log | tail -200
           BUILD_EXIT=$?
         fi
 
-        if [ $BUILD_EXIT -ne 0 ]; then
-          echo ""
-          echo "❌ BUILD FAILED"
-          echo "Last 50 lines of build log:"
-          tail -50 /tmp/build-v.log 2>/dev/null || tail -50 /tmp/build.log
-          exit 1
-        fi
+        [ $BUILD_EXIT -ne 0 ] && { echo "❌ BUILD FAILED"; exit 1; }
 
-        echo ""
-        echo "======================================="
-        echo "  Compile finished: $(date)"
-        echo "======================================="
+        echo "Finished: $(date)"
         echo "status=success" >> $GITHUB_OUTPUT
 
-    # =============================================
-    # ★ 关键：验证固件输出（正确目录 mt7620）
-    # =============================================
+    # ★ 修正：查找 hc5861（非 hc5861b）
     - name: Verify firmware
       if: steps.compile.outputs.status == 'success'
       run: |
-        # ★ 正确的输出目录
         OUTPUT="openwrt/bin/targets/ramips/mt7620"
 
-        if [ ! -d "$OUTPUT" ]; then
-          echo "❌ Output directory not found: $OUTPUT"
-          echo "Available target directories:"
-          find openwrt/bin/targets/ -type d | head -20
-          exit 1
-        fi
+        [ ! -d "$OUTPUT" ] && { echo "❌ Output dir not found"; exit 1; }
 
-        echo "========== All output files =========="
-        ls -lhS "$OUTPUT"/ 2>/dev/null
-        echo "======================================"
+        echo "========== Output files =========="
+        ls -lhS "$OUTPUT"/
+        echo "=================================="
 
-        # 查找 sysupgrade
-        SYSUPGRADE=$(find "$OUTPUT" -name "*hc5861b*sysupgrade*" -type f | head -1)
+        # ★ 关键修正：搜索 hc5861（非 hc5861b）
+        SYSUPGRADE=$(find "$OUTPUT" -name "*hc5861*sysupgrade*" -type f | head -1)
         if [ -n "$SYSUPGRADE" ]; then
           SIZE=$(ls -lh "$SYSUPGRADE" | awk '{print $5}')
-          NAME=$(basename "$SYSUPGRADE")
-          echo "✅ Sysupgrade: $NAME ($SIZE)"
-          echo "SYSUPGRADE_NAME=$NAME" >> $GITHUB_ENV
-          echo "SYSUPGRADE_SIZE=$SIZE" >> $GITHUB_ENV
+          echo "✅ Sysupgrade: $(basename $SYSUPGRADE) ($SIZE)"
         else
-          echo "❌ Sysupgrade firmware NOT FOUND!"
-          echo "All .bin/.img files:"
+          echo "❌ Sysupgrade NOT FOUND"
+          echo "All firmware files:"
           find "$OUTPUT" -type f \( -name "*.bin" -o -name "*.img" \) | sort
           exit 1
-        fi
-
-        # 查找 factory
-        FACTORY=$(find "$OUTPUT" -name "*hc5861b*factory*" -type f | head -1)
-        if [ -n "$FACTORY" ]; then
-          SIZE=$(ls -lh "$FACTORY" | awk '{print $5}')
-          echo "✅ Factory: $(basename $FACTORY) ($SIZE)"
-        else
-          echo "ℹ️  No factory firmware (normal for some NAND devices)"
         fi
 
     - name: Organize files
@@ -284,7 +216,7 @@ jobs:
       uses: actions/upload-artifact@v4
       if: steps.compile.outputs.status == 'success'
       with:
-        name: OpenWrt-HC5861B-Hysteria2-${{ env.FILE_DATE }}
+        name: OpenWrt-HC5861-Hysteria2-${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}/*
 
     - name: Create Release
@@ -295,31 +227,27 @@ jobs:
       with:
         tag_name: v23.05.5-${{ env.FILE_DATE }}
         body: |
-          ## OpenWrt 23.05.5 — 极路由3 Pro (HC5861B) + Passwall2 Hysteria2
+          ## OpenWrt 23.05.5 — 极路由3 Pro (HC5861) + Passwall2 Hysteria2
 
           | 项目 | 值 |
           |---|---|
-          | 设备 | HiWiFi R33 / HC5861B / 极路由3 Pro |
+          | 设备 | HiWiFi R33 / HC5861 / 极路由3 Pro |
           | CPU | MT7620A 单核 580MHz |
           | 内存 | 128MB DDR2 / 128MB NAND |
           | 默认 IP | **192.168.10.1** |
-          | 默认密码 | 无 (首次登录设置) |
+          | 默认密码 | 无 |
 
-          ### 核心功能
-          - ✅ **Passwall2** 透明代理 (中文界面)
-          - ✅ **Hysteria2** 独立客户端 (首选，轻量)
-          - ✅ **SingBox** 备选核心 (支持更多协议)
-          - ✅ **ChinaDNS-NG** DNS 智能分流
-          - ✅ **TPROXY** TCP + UDP 全透明代理
-          - ✅ **zram-swap** 内存优化
+          ### 包含组件
+          - ✅ Passwall2 (中文界面)
+          - ✅ Hysteria2 独立客户端
+          - ✅ SingBox 备选核心 (含 QUIC)
+          - ✅ ChinaDNS-NG DNS 分流
+          - ✅ TPROXY TCP+UDP 透明代理
+          - ✅ zram-swap 内存优化
 
-          ### 使用方式
-          1. 刷入固件，访问 `192.168.10.1`
-          2. 服务 → PassWall2 → 添加节点 → Hysteria2
-          3. 填写服务器地址、端口、密码
+          ### 使用
+          1. Breed 刷入 `sysupgrade.bin`
+          2. 访问 `192.168.10.1`
+          3. 服务 → PassWall2 → 添加 Hysteria2 节点
           4. 开启主开关，所有设备自动走代理
-
-          ### 刷机
-          - Breed → `sysupgrade.bin`
-          - OpenWrt → `sysupgrade -v xxx.bin`
         files: ${{ env.FIRMWARE }}/*
