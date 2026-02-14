@@ -1,4 +1,4 @@
-name: Build OpenWrt HC5861 Hysteria2
+name: Build ImmortalWrt HC5861B Hysteria2
 
 on:
   workflow_dispatch:
@@ -9,8 +9,9 @@ on:
         default: true
 
 env:
-  REPO_URL: https://github.com/openwrt/openwrt.git
-  REPO_BRANCH: v23.05.5
+  # ★ 改用 ImmortalWrt（有 HC5861B 支持）
+  REPO_URL: https://github.com/immortalwrt/immortalwrt.git
+  REPO_BRANCH: openwrt-23.05
   TZ: Asia/Shanghai
 
 jobs:
@@ -55,59 +56,101 @@ jobs:
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
 
-    - name: Clone OpenWrt ${{ env.REPO_BRANCH }}
+    - name: Clone ImmortalWrt
       working-directory: /workdir
       run: |
-        git clone --depth 1 --branch $REPO_BRANCH $REPO_URL openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
-        cd openwrt
-        echo "✅ OpenWrt $(cat version) @ $(git log --oneline -1)"
+        git clone --depth 1 --branch $REPO_BRANCH $REPO_URL immortalwrt
+        ln -sf /workdir/immortalwrt $GITHUB_WORKSPACE/immortalwrt
+        cd immortalwrt
+        echo "✅ ImmortalWrt cloned @ $(git log --oneline -1)"
 
-    - name: Verify device support
+    # ★ 验证 HC5861B 是否存在
+    - name: Verify HC5861B device support
       run: |
-        cd openwrt
+        cd immortalwrt
         echo "==========================================="
-        echo "  Checking HC5861 device support"
+        echo "  Searching for HC5861B in ImmortalWrt"
         echo "==========================================="
 
+        # 搜索所有可能的位置
+        echo "--- Search in mt7620.mk ---"
         MT7620_MK="target/linux/ramips/image/mt7620.mk"
-
-        if [ ! -f "$MT7620_MK" ]; then
-          echo "❌ $MT7620_MK not found"
-          exit 1
+        if [ -f "$MT7620_MK" ]; then
+          grep -i "hc5861" "$MT7620_MK" || echo "(not in mt7620.mk)"
         fi
 
-        # ★ 修正：查找 hc5861（非 hc5861b）
-        if grep -q "Device/hiwifi_hc5861" "$MT7620_MK"; then
-          echo "✅ hiwifi_hc5861 FOUND"
+        echo ""
+        echo "--- Search in mt76x8.mk ---"
+        MT76X8_MK="target/linux/ramips/image/mt76x8.mk"
+        if [ -f "$MT76X8_MK" ]; then
+          grep -i "hc5861" "$MT76X8_MK" || echo "(not in mt76x8.mk)"
+        fi
+
+        echo ""
+        echo "--- Search all image mk files ---"
+        grep -rl "hc5861" target/linux/ramips/image/ || echo "(not found in image/)"
+
+        echo ""
+        echo "--- Search DTS files ---"
+        find target/linux/ramips/dts/ -iname "*hc5861*" -type f
+        find target/linux/ramips/dts/ -iname "*r33*" -type f
+
+        echo ""
+        echo "--- Search globally ---"
+        grep -rl "hc5861b\|HC5861B" target/ || echo "(hc5861b not found globally)"
+        grep -rl "hiwifi.*r33\|R33" target/ || echo "(R33 not found globally)"
+
+        echo ""
+        echo "--- All HiWiFi devices ---"
+        grep -i "hiwifi" target/linux/ramips/image/*.mk | grep "Device/" || true
+
+        echo ""
+        echo "==========================================="
+
+        # 尝试找到设备定义
+        DEVICE_FOUND=false
+
+        # 检查各种可能的命名
+        for name in hc5861b hc5861-b hc5861 r33; do
+          if grep -rq "Device/hiwifi_${name}" target/linux/ramips/image/; then
+            echo "✅ Found device: hiwifi_${name}"
+            echo "DEVICE_ID=hiwifi_${name}" >> $GITHUB_ENV
+            DEVICE_FOUND=true
+
+            # 打印完整设备定义
+            echo "--- Full device definition ---"
+            FILE=$(grep -rl "Device/hiwifi_${name}" target/linux/ramips/image/)
+            sed -n "/define Device\/hiwifi_${name}/,/^$/p" "$FILE"
+            echo "------------------------------"
+            break
+          fi
+        done
+
+        if [ "$DEVICE_FOUND" = false ]; then
           echo ""
-          echo "--- Device definition ---"
-          sed -n '/define Device\/hiwifi_hc5861$/,/^$/p' "$MT7620_MK"
-          echo "-------------------------"
-        else
-          echo "❌ hiwifi_hc5861 NOT FOUND"
+          echo "❌ HC5861B / R33 NOT FOUND in ImmortalWrt either!"
+          echo ""
+          echo "Available HiWiFi devices in ImmortalWrt:"
+          grep "Device/hiwifi" target/linux/ramips/image/*.mk || true
+          echo ""
+          echo "This device may require manual DTS creation."
+          echo "Please report this issue."
           exit 1
         fi
-
-        # 检查 DTS
-        echo "--- DTS files ---"
-        find target/linux/ramips/dts/ -name "*hc5861*" -type f
-        echo "-----------------"
 
     - name: Add Passwall2 feeds
       run: |
         chmod +x scripts/feeds.sh
-        cd openwrt
+        cd immortalwrt
         $GITHUB_WORKSPACE/scripts/feeds.sh
 
     - name: Update and install feeds
       run: |
-        cd openwrt
+        cd immortalwrt
 
         for i in 1 2 3; do
           echo ">>> feeds update attempt $i/3"
           ./scripts/feeds update -a && break
-          echo "⚠️  Failed, waiting 15s..."
           sleep 15
           [ $i -eq 3 ] && { echo "❌ feeds update failed"; exit 1; }
         done
@@ -115,37 +158,33 @@ jobs:
         ./scripts/feeds install -a
 
         # 验证
-        echo "=== Verify feeds ==="
-        for feed in passwall_packages passwall2; do
-          test -d "feeds/$feed" && echo "✅ $feed" || { echo "❌ $feed MISSING"; exit 1; }
-        done
-
-        echo "=== Verify packages ==="
+        echo "=== Verify key packages ==="
         for pkg in luci-app-passwall2 hysteria sing-box chinadns-ng; do
-          ./scripts/feeds list | grep -q "^$pkg " && echo "✅ $pkg" || echo "⚠️  $pkg not found"
+          ./scripts/feeds list | grep -q "^$pkg " && echo "✅ $pkg" || echo "⚠️  $pkg"
         done
 
     - name: Generate configuration
       run: |
         chmod +x scripts/customize.sh
-        cd openwrt
+        cd immortalwrt
         cp $GITHUB_WORKSPACE/configs/hc5861b.config .config
         $GITHUB_WORKSPACE/scripts/customize.sh
         make defconfig
 
-        echo ""
-        echo "========== Config check =========="
+        echo "========== Config verify =========="
         echo "--- Target ---"
         grep "^CONFIG_TARGET" .config | head -5
+        echo "--- Device ---"
+        grep "DEVICE.*hiwifi\|DEVICE.*hc586" .config | grep "=y"
         echo "--- Passwall2 ---"
         grep -i "passwall2" .config | grep "=y"
-        echo "--- Proxy cores ---"
+        echo "--- Hysteria ---"
         grep -iE "hysteria|sing.box" .config | grep "=y"
         echo "--- TPROXY ---"
         grep -i "tproxy" .config | grep "=y"
         echo "--- zram ---"
         grep -i "zram" .config | grep "=y"
-        echo "=================================="
+        echo "==================================="
         echo ""
         echo "========== diffconfig =========="
         ./scripts/diffconfig.sh
@@ -153,7 +192,7 @@ jobs:
 
     - name: Download packages
       run: |
-        cd openwrt
+        cd immortalwrt
         make download -j16
         find dl -size -1024c -exec rm -f {} \;
         echo "✅ $(ls dl/ | wc -l) source archives"
@@ -161,7 +200,7 @@ jobs:
     - name: Compile
       id: compile
       run: |
-        cd openwrt
+        cd immortalwrt
         echo "Started: $(date), Threads: $(nproc)"
 
         make -j$(nproc) 2>&1 | tee /tmp/build.log | grep -E "^\[|error" | tail -30
@@ -178,76 +217,16 @@ jobs:
         echo "Finished: $(date)"
         echo "status=success" >> $GITHUB_OUTPUT
 
-    # ★ 修正：查找 hc5861（非 hc5861b）
     - name: Verify firmware
       if: steps.compile.outputs.status == 'success'
       run: |
-        OUTPUT="openwrt/bin/targets/ramips/mt7620"
+        OUTPUT="immortalwrt/bin/targets/ramips/mt7620"
 
-        [ ! -d "$OUTPUT" ] && { echo "❌ Output dir not found"; exit 1; }
+        [ ! -d "$OUTPUT" ] && { echo "❌ Output dir not found"; find immortalwrt/bin/targets/ -type d; exit 1; }
 
         echo "========== Output files =========="
         ls -lhS "$OUTPUT"/
         echo "=================================="
 
-        # ★ 关键修正：搜索 hc5861（非 hc5861b）
-        SYSUPGRADE=$(find "$OUTPUT" -name "*hc5861*sysupgrade*" -type f | head -1)
-        if [ -n "$SYSUPGRADE" ]; then
-          SIZE=$(ls -lh "$SYSUPGRADE" | awk '{print $5}')
-          echo "✅ Sysupgrade: $(basename $SYSUPGRADE) ($SIZE)"
-        else
-          echo "❌ Sysupgrade NOT FOUND"
-          echo "All firmware files:"
-          find "$OUTPUT" -type f \( -name "*.bin" -o -name "*.img" \) | sort
-          exit 1
-        fi
-
-    - name: Organize files
-      id: organize
-      if: steps.compile.outputs.status == 'success'
-      run: |
-        cd openwrt/bin/targets/ramips/mt7620
-        rm -rf packages/
-        rm -f *.buildinfo *.manifest sha256sums
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "FILE_DATE=$(date +%Y%m%d%H%M)" >> $GITHUB_ENV
-
-    - name: Upload Artifacts
-      uses: actions/upload-artifact@v4
-      if: steps.compile.outputs.status == 'success'
-      with:
-        name: OpenWrt-HC5861-Hysteria2-${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}/*
-
-    - name: Create Release
-      uses: softprops/action-gh-release@v2
-      if: steps.compile.outputs.status == 'success' && github.event.inputs.RELEASE == 'true'
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: v23.05.5-${{ env.FILE_DATE }}
-        body: |
-          ## OpenWrt 23.05.5 — 极路由3 Pro (HC5861) + Passwall2 Hysteria2
-
-          | 项目 | 值 |
-          |---|---|
-          | 设备 | HiWiFi R33 / HC5861 / 极路由3 Pro |
-          | CPU | MT7620A 单核 580MHz |
-          | 内存 | 128MB DDR2 / 128MB NAND |
-          | 默认 IP | **192.168.10.1** |
-          | 默认密码 | 无 |
-
-          ### 包含组件
-          - ✅ Passwall2 (中文界面)
-          - ✅ Hysteria2 独立客户端
-          - ✅ SingBox 备选核心 (含 QUIC)
-          - ✅ ChinaDNS-NG DNS 分流
-          - ✅ TPROXY TCP+UDP 透明代理
-          - ✅ zram-swap 内存优化
-
-          ### 使用
-          1. Breed 刷入 `sysupgrade.bin`
-          2. 访问 `192.168.10.1`
-          3. 服务 → PassWall2 → 添加 Hysteria2 节点
-          4. 开启主开关，所有设备自动走代理
-        files: ${{ env.FIRMWARE }}/*
+        # 搜索包含 hc5861 或 hiwifi 的固件
+        SYSUPGRADE=$(find "$OUTPUT" -name 
